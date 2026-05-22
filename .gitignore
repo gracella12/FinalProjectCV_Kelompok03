@@ -1,0 +1,6 @@
+__pycache__/
+dataset/
+images/
+images.zip
+*.mp4
+*.pt
