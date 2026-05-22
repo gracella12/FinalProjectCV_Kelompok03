@@ -3,9 +3,12 @@ import numpy as np
 import cv2
 import torch
 from ultralytics import YOLO
+from deep_sort_realtime.deepsort_tracker import DeepSort
 
+# ==========================================
 # 1. CONFIG
-VIDEO_PATH = "D:\\uni - 4th sem\\uni 4th\\CV\\FinalProjectCV_Kelompok03\\dataset\\Cv Malam.mp4"
+# ==========================================
+VIDEO_PATH = "D:\\uni - 4th sem\\uni 4th\\CV\\FinalProjectCV_Kelompok03\\dataset\\Cv Pagi.mp4"
 TARGET_W, TARGET_H = 1280, 720
 
 ROI_NAMES  = ['traffic_light', 'detection_area', 'virtual_line']
@@ -15,11 +18,10 @@ ROI_COLORS = {
     'virtual_line':   (255,  0,   0),
 }
 
-# HSV ranges yang benar
 HSV_RANGES = {
     'red': [
         (np.array([0,   120,  70]),  np.array([10,  255, 255])),
-        (np.array([170, 120,  70]),  np.array([180, 255, 255])),  # merah wrap-around
+        (np.array([170, 120,  70]),  np.array([180, 255, 255])),
     ],
     'yellow': [
         (np.array([20, 100, 100]),   np.array([35,  255, 255])),
@@ -36,12 +38,16 @@ STATUS_COLOR = {
     'unknown': (128, 128, 128),
 }
 
-# 2. FUNGSI WARNA BOX KENDARAAN
-def getColours(cls_num):
-    random.seed(cls_num)
+VEHICLE_CLASSES = ['car', 'motorcycle', 'bus', 'truck']
+
+# State tracking antar frame
+crossed_ids = set()  # track_id yang sudah violation
+prev_x1     = {}     # {track_id: x1} posisi ban belakang frame sebelumnya
+
+def getColours(track_id):
+    random.seed(track_id)
     return tuple(random.randint(0, 255) for _ in range(3))
 
-# 3. DEFINE ROI DARI FRAME PERTAMA
 def define_roi(frame_ref):
     all_rois    = {}
     display_img = frame_ref.copy()
@@ -90,15 +96,10 @@ def define_roi(frame_ref):
     cv2.destroyWindow(win)
     return all_rois
 
-# 4. CROP TRAFFIC LIGHT DARI POLYGON
-def crop_traffic_light(frame, tl_pts):
-    """Crop bounding box dari polygon tl_pts"""
-    x, y, w, h = cv2.boundingRect(tl_pts)
-    return frame[y:y+h, x:x+w], (x, y)
-
-# 5. DETEKSI WARNA LAMPU (HSV)
 def traffic_light_detection(frame, tl_pts):
-    crop, (ox, oy) = crop_traffic_light(frame, tl_pts)
+    x, y, w, h = cv2.boundingRect(tl_pts)
+    crop = frame[y:y+h, x:x+w]
+
     if crop.size == 0:
         return 'unknown'
 
@@ -112,17 +113,36 @@ def traffic_light_detection(frame, tl_pts):
         counts[color] = cv2.countNonZero(mask)
 
     best   = max(counts, key=counts.get)
-    status = best if counts[best] > 80 else 'unknown'
+    status = best if counts[best] > 30 else 'unknown'
 
-    # Tampilkan status di frame
-    label     = f"Traffic Light: {status.upper()}"
     txt_color = STATUS_COLOR[status]
-    cv2.putText(frame, label, (10, 60),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, txt_color, 2)
+    cv2.putText(frame, f"Traffic Light: {status.upper()}",
+                (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, txt_color, 2)
 
     return status
 
-# Apply ROI
+def is_in_detection_area(x1, y2, da_pts):
+    """
+    Ban belakang = (x1, y2) pojok kiri bawah box.
+    Kendaraan dari kiri→kanan, ban belakang di sisi kiri (x1).
+    """
+    return cv2.pointPolygonTest(da_pts, (float(x1), float(y2)), False) >= 0
+
+def crosses_virtual_line(track_id, x1, sl_pts):
+    """
+    Violation hanya saat BARU melewati garis:
+    prev_x1 < line_x  →  x1 >= line_x
+    """
+    line_x = int(np.mean([p[0] for p in sl_pts]))
+
+    prev = prev_x1.get(track_id, None)
+    prev_x1[track_id] = x1
+
+    if prev is None:
+        return False
+
+    return (prev < line_x) and (x1 >= line_x)
+
 def apply_roi(frame, tl_pts, da_pts):
     mask_tl = np.zeros(frame.shape[:2], dtype=np.uint8)
     mask_da = np.zeros(frame.shape[:2], dtype=np.uint8)
@@ -132,41 +152,96 @@ def apply_roi(frame, tl_pts, da_pts):
     masked_da = cv2.bitwise_and(frame, frame, mask=mask_da)
     return masked_tl, masked_da
 
-def process_frame(frame, model, device_type, use_half, tl_pts, da_pts, sl_pts):
-    # Deteksi warna lampu dari crop ROI traffic light
+def process_frame(frame, model, tracker, device_type, use_half,
+                  tl_pts, da_pts, sl_pts, total_violations):
+
+    # Step 1: Deteksi warna lampu
     tl_status = traffic_light_detection(frame, tl_pts)
 
-    # YOLO hanya di detection area
+    # Step 2: YOLO detect (bukan track) di detection area
     _, masked_da = apply_roi(frame, tl_pts, da_pts)
-    results = model.track(
+    results = model.predict(
         masked_da,
-        stream=True,
         imgsz=480,
         half=use_half,
         device=device_type,
         verbose=False
     )
 
-    # Gambar batas ROI
+    # Step 3: Siapkan deteksi untuk DeepSORT
+    # Format yang dibutuhkan DeepSORT: list of ([x1,y1,w,h], conf, class_name)
+    detections = []
+    for result in results:
+        class_names = result.names
+        for box in result.boxes:
+            conf       = float(box.conf[0])
+            cls        = int(box.cls[0])
+            class_name = class_names[cls]
+
+            if conf > 0.4 and class_name in VEHICLE_CLASSES:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                w = x2 - x1
+                h = y2 - y1
+                # DeepSORT input: ([left, top, w, h], confidence, class_label)
+                detections.append(([x1, y1, w, h], conf, class_name))
+
+    # Step 4: Update DeepSORT tracker
+    # tracks berisi objek dengan .track_id, .to_ltrb(), .det_class, .is_confirmed()
+    tracks = tracker.update_tracks(detections, frame=masked_da)
+
+    # Step 5: Gambar batas ROI
     cv2.polylines(frame, [da_pts], isClosed=True,  color=(0, 255,   0), thickness=2)
     cv2.polylines(frame, [tl_pts], isClosed=True,  color=(0,   0, 255), thickness=2)
     cv2.polylines(frame, [sl_pts], isClosed=False, color=(255,  0,   0), thickness=3)
 
-    for result in results:
-        class_names = result.names
-        for box in result.boxes:
-            if box.conf[0] > 0.4:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                cls        = int(box.cls[0])
-                class_name = class_names[cls]
-                conf       = float(box.conf[0])
-                colour     = getColours(cls)
-                if class_name in ['car', 'motorcycle', 'bus', 'truck']:
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 2)
-                    cv2.putText(frame, f"{class_name} {conf:.2f}",
-                                (x1, max(y1 - 10, 20)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, colour, 2)
-    return frame
+    # Step 6: Loop tracks + cek pelanggaran
+    for track in tracks:
+        # Hanya proses track yang sudah dikonfirmasi DeepSORT
+        # (minimal n_init frame berturut-turut terdeteksi)
+        if not track.is_confirmed():
+            continue
+
+        track_id   = track.track_id
+        class_name = track.det_class if track.det_class else 'unknown'
+        colour     = getColours(track_id)
+
+        # Ambil koordinat dari DeepSORT (format: left, top, right, bottom)
+        ltrb = track.to_ltrb()
+        x1, y1, x2, y2 = map(int, ltrb)
+
+        in_area  = is_in_detection_area(x1, y2, da_pts)
+        is_red   = tl_status == 'red'
+
+        is_violation = False
+        if track_id not in crossed_ids:
+            just_crossed = crosses_virtual_line(track_id, x1, sl_pts)
+            if in_area and just_crossed and is_red:
+                crossed_ids.add(track_id)
+                total_violations += 1
+                is_violation = True
+
+        # Gambar box
+        if is_violation:
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
+            cv2.putText(frame, "VIOLATION",
+                        (x1, max(y1 - 25, 20)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2)
+        else:
+            cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 2)
+
+        # Label class + track ID
+        cv2.putText(frame, f"{class_name} ID:{track_id}",
+                    (x1, max(y1 - 8, 20)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, colour, 2)
+
+        # Debug: titik ban belakang
+        cv2.circle(frame, (x1, y2), 5, (0, 255, 255), -1)
+
+    # Step 7: Counter pelanggaran
+    cv2.putText(frame, f"Violations: {total_violations}",
+                (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+    return frame, total_violations
 
 if __name__ == '__main__':
     device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -175,6 +250,20 @@ if __name__ == '__main__':
 
     model = YOLO('yolo11n.pt')
 
+    # Inisialisasi DeepSORT
+    # max_age     : berapa frame track dipertahankan walau tidak terdeteksi
+    # n_init      : berapa frame berturut-turut sebelum track dikonfirmasi
+    # max_iou_distance: threshold IoU untuk matching
+    tracker = DeepSort(
+        max_age=30,
+        n_init=3,
+        max_iou_distance=0.7,
+        embedder='mobilenet',        # model re-ID ringan
+        half=use_half,
+        embedder_gpu=use_half,
+    )
+
+    # Ambil frame pertama untuk define ROI
     cap = cv2.VideoCapture(VIDEO_PATH)
     ret, first_frame = cap.read()
     cap.release()
@@ -191,6 +280,8 @@ if __name__ == '__main__':
     da_pts = np.array(rois["detection_area"], dtype=np.int32)
     sl_pts = np.array(rois["virtual_line"],   dtype=np.int32)
 
+    total_violations = 0
+
     cap = cv2.VideoCapture(VIDEO_PATH)
     print("\nMemulai deteksi... tekan 'q' untuk keluar.")
 
@@ -200,14 +291,17 @@ if __name__ == '__main__':
             print("Video selesai.")
             break
 
-        frame     = cv2.resize(frame, (TARGET_W, TARGET_H))
-        processed = process_frame(frame, model, device_type, use_half,
-                                  tl_pts, da_pts, sl_pts)
+        frame = cv2.resize(frame, (TARGET_W, TARGET_H))
+        processed, total_violations = process_frame(
+            frame, model, tracker, device_type, use_half,
+            tl_pts, da_pts, sl_pts, total_violations
+        )
 
-        cv2.imshow("YOLO Detection", processed)
+        cv2.imshow("YOLO + DeepSORT", processed)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             print("Dihentikan oleh user.")
             break
 
+    print(f"\nTotal pelanggaran terdeteksi: {total_violations}")
     cap.release()
     cv2.destroyAllWindows()
