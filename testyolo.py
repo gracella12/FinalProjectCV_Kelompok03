@@ -7,6 +7,8 @@ def getColours(cls_num):
     random.seed(cls_num)
     return tuple(random.randint(0, 255) for _ in range(3))
 
+# Define ROI
+
 # Mengecek apakah GPU (CUDA) tersedia. Jika tidak, akan otomatis pakai CPU.
 # Ini mencegah error saat menggunakan fitur half-precision (FP16).
 device_type = 'cuda' if torch.cuda.is_available() else 'cpu'

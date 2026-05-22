@@ -5,16 +5,10 @@ import torch
 import random
 from ultralytics import YOLO
 
-# ==========================================
-# 1. FUNGSI WARNA 
-# ==========================================
 def getColours(cls_num):
     random.seed(cls_num)
     return tuple(random.randint(0, 255) for _ in range(3))
 
-# ==========================================
-# 2. LOAD DATA ROI DARI JSON
-# ==========================================
 with open("roi_config.json") as f:
     roi_config = json.load(f)
 
@@ -22,9 +16,6 @@ tl_points = np.array(roi_config["traffic_light"], dtype=np.int32)
 da_points = np.array(roi_config["detection_area"], dtype=np.int32)
 sl_points = np.array(roi_config["virtual_line"], dtype=np.int32)
 
-# ==========================================
-# 3. FUNGSI PEMOTONG FRAME VIDEO
-# ==========================================
 def apply_roi(frame):
     mask_tl = np.zeros(frame.shape[:2], dtype=np.uint8)
     mask_da = np.zeros(frame.shape[:2], dtype=np.uint8)
@@ -110,3 +101,5 @@ if __name__ == '__main__':
 
     videoCap.release()
     cv2.destroyAllWindows()
+
+    
