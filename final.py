@@ -9,7 +9,7 @@ from ultralytics import YOLO
 #2. Deteksi kendaraan di detection area using YOLOv8
 #3. Buat logic untuk menentukan violation
 
-PATH = r'D:\uni - 4th sem\uni 4th\CV\FinalProjectCV_Kelompok03\dataset\Cv Pagi.mp4'
+PATH = r'D:\uni - 4th sem\uni 4th\CV\FinalProjectCV_Kelompok03\dataset\Cv Malam.mp4'
 
 ROI_NAMES = ['traffic_light', 'detection_area', 'line']
 
@@ -156,7 +156,6 @@ def vehicles_detected(frame, da_pts, line_pts, status):
         if cls_id not in VEHICLES:
             continue
  
-        # FIX: akses track_id pakai index i langsung dari boxes.id
         track_id = None
         if boxes.id is not None:
             track_id = int(boxes.id[i])
@@ -183,7 +182,7 @@ def vehicles_detected(frame, da_pts, line_pts, status):
             prev_pt = prev_vehicle_positions[track_id]
             delta_x = bottom[0] - prev_pt[0]
 
-            is_moving_right = delta_x > 2
+            is_moving_right = delta_x > 5
 
             if is_moving_right:
                 if status == 'red' and is_crossing_line(prev_pt, bottom, line_pts):
@@ -256,7 +255,7 @@ def read_video_with_roi(roi):
         cv2.putText(frame, f"Total Violations: {len(violated_ids)}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
         
         cv2.imshow("Output", frame)
-        if cv2.waitKey(5) & 0xFF == ord('q'):
+        if cv2.waitKey(10) & 0xFF == ord('q'):
             break
  
     cap.release()
