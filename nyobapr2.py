@@ -6,10 +6,10 @@ from ultralytics import YOLO
 
 #0. Read file, setup, and preprocessing
 #1. Fokus di traffic light detection
-#2. Deteksi kendaraan di detection area using YOLOv11
+#2. Deteksi kendaraan di detection area using YOLOv8
 #3. Buat logic untuk menentukan violation
 
-PATH = r'D:\uni - 4th sem\uni 4th\CV\FinalProjectCV_Kelompok03\dataset\Cv Malam.mp4'
+PATH = r'D:\uni - 4th sem\uni 4th\CV\FinalProjectCV_Kelompok03\dataset\Cv Pagi.mp4'
 
 ROI_NAMES = ['traffic_light', 'detection_area', 'line']
 
@@ -35,7 +35,7 @@ CROSS_DIST = 15  # jarak maksimal titik ke garis untuk dianggap crossing
 violated_ids = set()
 prev_vehicle_positions = {}
 
-model = YOLO('yolo11n.pt')
+model = YOLO('yolov8n.pt')
 
 def get_first_frame(video_path):
     cap = cv2.VideoCapture(video_path)
@@ -56,13 +56,13 @@ def define_roi(frame):
             points.append((x, y))
             cv2.circle(display_img, (x, y), 4, (0, 255, 255), -1)
             if len(points) >= 2:
-                cv2.line(display_img, points[-2], points[-1], (0, 255, 255), 1)
+                cv2.polylines(display_img, [np.array(points[-2:])], False, (0, 255, 255), 1)
             cv2.imshow("Define ROI", display_img)
 
     cv2.namedWindow("Define ROI")
     cv2.setMouseCallback("Define ROI", click_event)
 
-    BOX_ROIS = {'traffic_light', 'detection_area'}  # tambah nama lain di sini kalau perlu
+    BOX_ROIS = {'traffic_light', 'detection_area'}
 
     for name in ROI_NAMES:
         points.clear()
@@ -142,7 +142,7 @@ def is_in_detection_area(point, da_pts):
 def vehicles_detected(frame, da_pts, line_pts, status):
     global prev_vehicle_positions, violated_ids
 
-    results = model.track(frame, conf=0.1, persist=True, tracker='bytetrack.yaml', verbose=False)
+    results = model.track(frame, conf=0.5, persist=True, tracker='bytetrack.yaml', verbose=False)
  
     if results is None or results[0].boxes is None:
         return frame, 0
@@ -162,9 +162,9 @@ def vehicles_detected(frame, da_pts, line_pts, status):
             track_id = int(boxes.id[i])
  
         x1, y1, x2, y2 = map(int, box.xyxy[0])
-        center = ((x1 + x2) // 2, (y1 + y2) // 2)
+        bottom = (x1, y2)
  
-        if not is_in_detection_area(center, da_pts):
+        if not is_in_detection_area(bottom, da_pts):
             continue
  
         vehicle_count += 1
@@ -181,18 +181,23 @@ def vehicles_detected(frame, da_pts, line_pts, status):
                 and track_id in prev_vehicle_positions):
  
             prev_pt = prev_vehicle_positions[track_id]
-            if is_crossing_line(prev_pt, center, line_pts):
-                violated_ids.add(track_id)
-                is_violated = True
+            delta_x = bottom[0] - prev_pt[0]
+
+            is_moving_right = delta_x > 2
+
+            if is_moving_right:
+                if status == 'red' and is_crossing_line(prev_pt, bottom, line_pts):
+                    violated_ids.add(track_id)
+                    is_violated = True
                 
         # Simpan posisi untuk frame berikutnya
         if track_id is not None:
-            prev_vehicle_positions[track_id] = center
+            prev_vehicle_positions[track_id] = bottom
 
         box_color = (0, 0, 255) if is_violated else (0, 255, 0)
         cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
         cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
-        cv2.circle(frame, center, 4, box_color, -1)
+        cv2.circle(frame, bottom, 4, box_color, -1)
 
     return frame, vehicle_count
 
@@ -201,11 +206,6 @@ def side_of_line(point, p1, p2):
     return ((p2[0]-p1[0]) * (point[1]-p1[1]) - (p2[1]-p1[1]) * (point[0]-p1[0]))
 
 def is_crossing_line(prev_pt, curr_pt, line_pts):
-    """
-    True jika track berpindah sisi terhadap stop-line DALAM satu frame,
-    dan titik sekarang cukup dekat ke garis (CROSS_DIST px).
-    Ini lebih robust dari jarak titik-ke-garis saja.
-    """
     p1 = line_pts[0]
     p2 = line_pts[1]
     s_prev = side_of_line(prev_pt, p1, p2)
@@ -256,7 +256,7 @@ def read_video_with_roi(roi):
         cv2.putText(frame, f"Total Violations: {len(violated_ids)}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
         
         cv2.imshow("Output", frame)
-        if cv2.waitKey(10) & 0xFF == ord('q'):
+        if cv2.waitKey(5) & 0xFF == ord('q'):
             break
  
     cap.release()
