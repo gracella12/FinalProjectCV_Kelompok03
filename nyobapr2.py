@@ -1,11 +1,13 @@
 import cv2
 import numpy as np
 import os
+from streamlit import status
 from ultralytics import YOLO
 
 #0. Read file, setup, and preprocessing
 #1. Fokus di traffic light detection
 #2. Deteksi kendaraan di detection area using YOLOv11
+#3. Buat logic untuk menentukan violation
 
 PATH = r'D:\uni - 4th sem\uni 4th\CV\FinalProjectCV_Kelompok03\dataset\Cv Malam.mp4'
 
@@ -28,6 +30,11 @@ STATUS_COLORS = {
 }
 
 VEHICLES = {2, 3, 5, 7}
+CROSS_DIST = 15  # jarak maksimal titik ke garis untuk dianggap crossing
+
+violated_ids = set()
+prev_vehicle_positions = {}
+
 model = YOLO('yolo11n.pt')
 
 def get_first_frame(video_path):
@@ -128,73 +135,133 @@ def detect_traffic_light_state(frame, tl_box_pts):
                 STATUS_COLORS.get(status, (128, 128, 128)), 2)
     return status
 
+#VEHICLES DETECTION IN DETECTION AREA
 def is_in_detection_area(point, da_pts):
     return cv2.pointPolygonTest(da_pts, (float(point[0]), float(point[1])), False) >= 0
 
-def vehicles_detected(frame, da_pts):
-    results = model.predict(frame, verbose=False, imgsz=640)
+def vehicles_detected(frame, da_pts, line_pts, status):
+    global prev_vehicle_positions, violated_ids
 
-    if results[0].boxes is None:
+    results = model.track(frame, conf=0.1, persist=True, tracker='bytetrack.yaml', verbose=False)
+ 
+    if results is None or results[0].boxes is None:
         return frame, 0
-
+ 
     vehicle_count = 0
-    for box in results[0].boxes:
+    boxes = results[0].boxes
+ 
+    for i, box in enumerate(boxes):
         cls_id = int(box.cls[0])
-
+ 
         if cls_id not in VEHICLES:
             continue
-
-        #mencari koordinat bounding box
+ 
+        # FIX: akses track_id pakai index i langsung dari boxes.id
+        track_id = None
+        if boxes.id is not None:
+            track_id = int(boxes.id[i])
+ 
         x1, y1, x2, y2 = map(int, box.xyxy[0])
-
-        #center point kendaraan
         center = ((x1 + x2) // 2, (y1 + y2) // 2)
-
+ 
         if not is_in_detection_area(center, da_pts):
             continue
-
+ 
         vehicle_count += 1
         conf = float(box.conf[0])
         label = f"{model.names[cls_id]} {conf:.2f}"
+        if track_id is not None:
+            label += f" id:{track_id}"
 
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(frame, label, (x1, y1 - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-        cv2.circle(frame, center, 4, (0, 255, 255), -1)
+        is_violated = (track_id in violated_ids) if track_id is not None else False
+        
+        if (track_id is not None
+                and status == 'red'
+                and track_id not in violated_ids
+                and track_id in prev_vehicle_positions):
+ 
+            prev_pt = prev_vehicle_positions[track_id]
+            if is_crossing_line(prev_pt, center, line_pts):
+                violated_ids.add(track_id)
+                is_violated = True
+                
+        # Simpan posisi untuk frame berikutnya
+        if track_id is not None:
+            prev_vehicle_positions[track_id] = center
+
+        box_color = (0, 0, 255) if is_violated else (0, 255, 0)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+        cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
+        cv2.circle(frame, center, 4, box_color, -1)
 
     return frame, vehicle_count
 
+#LINE DETECTION
+def side_of_line(point, p1, p2):
+    return ((p2[0]-p1[0]) * (point[1]-p1[1]) - (p2[1]-p1[1]) * (point[0]-p1[0]))
+
+def is_crossing_line(prev_pt, curr_pt, line_pts):
+    """
+    True jika track berpindah sisi terhadap stop-line DALAM satu frame,
+    dan titik sekarang cukup dekat ke garis (CROSS_DIST px).
+    Ini lebih robust dari jarak titik-ke-garis saja.
+    """
+    p1 = line_pts[0]
+    p2 = line_pts[1]
+    s_prev = side_of_line(prev_pt, p1, p2)
+    s_curr = side_of_line(curr_pt, p1, p2)
+ 
+    if s_prev == 0 or s_curr == 0:
+        return True  # tepat di garis
+ 
+    # Berpindah sisi?
+    if (s_prev > 0) != (s_curr > 0):
+        return True
+ 
+    # Atau sangat dekat ke garis?
+    x1, y1 = p1;  x2, y2 = p2
+    px, py = curr_pt
+    mag = np.hypot(x2-x1, y2-y1)
+    if mag < 1e-6:
+        return False
+    dist = abs((y2-y1)*px - (x2-x1)*py + x2*y1 - y2*x1) / mag
+    return dist < CROSS_DIST
+
 #MAIN PART
 def read_video_with_roi(roi):
+    violation_count = 0
+    line_pts = np.array(roi['line'], dtype=np.int32)
+    
     cap = cv2.VideoCapture(PATH)
-   
-
+ 
     if not cap.isOpened():
         raise ValueError(f"Gagal membuka video: {PATH}")
-
+ 
     da_pts = np.array(roi['detection_area'], dtype=np.int32)
+    line_pts = np.array(roi['line'], dtype=np.int32)
+
     while True:
         ret, frame = cap.read()
         if not ret:
             break
+ 
         frame = cv2.resize(frame, (1280, 720))
-
         draw_roi_overlay(frame, roi)
-
-        # Deteksi traffic light
+ 
+        status = 'unknown'
         if 'traffic_light' in roi:
             status = detect_traffic_light_state(frame, roi['traffic_light'])
-
-        # detection area
-        if 'detection_area' in roi:
-            frame, _ = vehicles_detected(frame, da_pts)
-
+ 
+        frame, count = vehicles_detected(frame, da_pts, line_pts, status)
+        cv2.putText(frame, f"Total Violations: {len(violated_ids)}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        
         cv2.imshow("Output", frame)
         if cv2.waitKey(10) & 0xFF == ord('q'):
             break
-
+ 
     cap.release()
     cv2.destroyAllWindows()
+    print(f"ID yang melanggar: {violated_ids}")
 
 if __name__ == "__main__":
     first_frame = get_first_frame(PATH)

@@ -139,7 +139,6 @@ def detect_traffic_light_state(frame, tl_pts):
 def is_in_detection_area(point, da_pts):
     return cv2.pointPolygonTest(da_pts, (float(point[0]), float(point[1])), False) >= 0
 
-
 def crosses_line(track_id, curr_x1, curr_y2, line_pts):
     """
     True jika jejak kendaraan (titik sebelumnya → titik sekarang)
@@ -212,6 +211,10 @@ def detect_vehicles(frame, masked_da, da_pts, line_pts, tl_status, total_violati
             cv2.circle(frame, (x1, y2), 5, (0, 255, 255), -1)
 
     return frame, total_violations
+
+def violation_detection(frame, da_pts, line_pts, tl_status, total_violations):
+
+        return total_violations
 
 def read_video_with_roi(roi):
     cap = cv2.VideoCapture(PATH)
