@@ -3,6 +3,7 @@ import numpy as np
 import os
 from streamlit import status
 from ultralytics import YOLO
+from collections import deque
 
 #0. Read file, setup, and preprocessing
 #1. Fokus di traffic light detection
@@ -31,11 +32,12 @@ STATUS_COLORS = {
 
 VEHICLES = {2, 3, 5, 7}
 CROSS_DIST = 15  # jarak maksimal titik ke garis untuk dianggap crossing
-
+DIRECTION_HISTORY = 10  # jumlah frame yang dipertimbangkan untuk arah
+vehicle_position_history = {}  # {track_id: deque([(x, y), ...])}
 violated_ids = set()
 prev_vehicle_positions = {}
 
-model = YOLO('yolov8n.pt')
+model = YOLO(r'D:\uni - 4th sem\uni 4th\CV\FinalProjectCV_Kelompok03\Model_V1\weights\best.pt')  # pastikan model ini sudah dilatih untuk mendeteksi kendaraan yang diinginkan
 
 def get_first_frame(video_path):
     cap = cv2.VideoCapture(video_path)
@@ -139,64 +141,94 @@ def detect_traffic_light_state(frame, tl_box_pts):
 def is_in_detection_area(point, da_pts):
     return cv2.pointPolygonTest(da_pts, (float(point[0]), float(point[1])), False) >= 0
 
-def vehicles_detected(frame, da_pts, line_pts, status):
-    global prev_vehicle_positions, violated_ids
+def is_in_violation_area(point, line_pts):
+    return cv2.pointPolygonTest(line_pts, (float(point[0]), float(point[1])), False) >= 0
 
-    results = model.track(frame, conf=0.5, persist=True, tracker='bytetrack.yaml', verbose=False)
- 
+def get_direction(history):
+    """
+    Hitung arah berdasarkan rata-rata perubahan x dari seluruh history.
+    Return: 'left_to_right' / 'right_to_left' / 'unknown'
+    """
+    if len(history) < 2:
+        return 'unknown'
+    
+    # Ambil semua delta_x dari history
+    deltas = [history[i][0] - history[i-1][0] for i in range(1, len(history))]
+    avg_delta = sum(deltas) / len(deltas)
+    
+    if avg_delta > 1.5:       # threshold kecil untuk filter noise diam
+        return 'left_to_right'
+    elif avg_delta < -1.5:
+        return 'right_to_left'
+    else:
+        return 'unknown'
+    
+
+def vehicles_detected(frame, da_pts, line_pts, tl_status):
+    global vehicle_position_history, violated_ids
+
+    results = model.track(frame, conf=0.5, persist=True,
+                          tracker='bytetrack.yaml', verbose=False)
+
     if results is None or results[0].boxes is None:
         return frame, 0
- 
+
     vehicle_count = 0
     boxes = results[0].boxes
- 
+
     for i, box in enumerate(boxes):
         cls_id = int(box.cls[0])
- 
         if cls_id not in VEHICLES:
             continue
- 
+
         track_id = None
         if boxes.id is not None:
             track_id = int(boxes.id[i])
- 
+
         x1, y1, x2, y2 = map(int, box.xyxy[0])
-        bottom = (x1, y2)
- 
-        if not is_in_detection_area(bottom, da_pts):
+        rear_point = (x1, y2) #titik belakang bawah bonding box
+
+        if not is_in_detection_area(rear_point, da_pts):
             continue
- 
+
         vehicle_count += 1
-        conf = float(box.conf[0])
+        conf  = float(box.conf[0])
         label = f"{model.names[cls_id]} {conf:.2f}"
         if track_id is not None:
             label += f" id:{track_id}"
 
-        is_violated = (track_id in violated_ids) if track_id is not None else False
-        
-        if (track_id is not None
-                and status == 'red'
-                and track_id not in violated_ids
-                and track_id in prev_vehicle_positions):
- 
-            prev_pt = prev_vehicle_positions[track_id]
-            delta_x = bottom[0] - prev_pt[0]
-
-            is_moving_right = delta_x > 5
-
-            if is_moving_right:
-                if status == 'red' and is_crossing_line(prev_pt, bottom, line_pts):
-                    violated_ids.add(track_id)
-                    is_violated = True
-                
-        # Simpan posisi untuk frame berikutnya
         if track_id is not None:
-            prev_vehicle_positions[track_id] = bottom
+            if track_id not in vehicle_position_history:
+                vehicle_position_history[track_id] = deque(maxlen=DIRECTION_HISTORY)
+            vehicle_position_history[track_id].append(rear_point)
+
+        direction = 'unknown'
+        if track_id is not None and track_id in vehicle_position_history:
+            direction = get_direction(vehicle_position_history[track_id])
+
+        is_violated = (track_id in violated_ids) if track_id is not None else False
+
+        if (track_id is not None
+                and tl_status == 'red'                      # lampu merah
+                and track_id not in violated_ids            # belum pernah violation
+                and direction == 'left_to_right'            # arah kiri → kanan
+                and is_in_violation_area(rear_point, line_pts)):      # masuk violation area
+            violated_ids.add(track_id)
+            is_violated = True
+            print(f"id:{track_id} | arah: {direction}.")
 
         box_color = (0, 0, 255) if is_violated else (0, 255, 0)
         cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
-        cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
-        cv2.circle(frame, bottom, 4, box_color, -1)
+        cv2.putText(frame, label, (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
+        cv2.circle(frame, rear_point, 5, box_color, -1)
+
+        # Info arah di bawah label
+        dir_color = (0, 200, 255) if direction == 'left_to_right' else \
+                    (255, 100, 0) if direction == 'right_to_left' else \
+                    (180, 180, 180)
+        cv2.putText(frame, direction, (x1, y1 - 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, dir_color, 1)
 
     return frame, vehicle_count
 
@@ -260,11 +292,9 @@ def read_video_with_roi(roi):
  
     cap.release()
     cv2.destroyAllWindows()
-    print(f"ID yang melanggar: {violated_ids}")
 
 if __name__ == "__main__":
     first_frame = get_first_frame(PATH)
     roi = define_roi(first_frame)
-    print(f"\nROI selesai: {list(roi.keys())}")
 
     read_video_with_roi(roi)

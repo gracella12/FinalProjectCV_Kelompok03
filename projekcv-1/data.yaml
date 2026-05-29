@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 4
+names: ['4', 'bus', 'car', 'motorcycle']
+
+roboflow:
+  workspace: gracellas-workspace-1yzyy
+  project: projekcv-pjkk5
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/gracellas-workspace-1yzyy/projekcv-pjkk5/dataset/1
